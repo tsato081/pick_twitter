@@ -27,10 +27,13 @@ def main():
     clf = pipeline("text-classification", model=args.model_dir, device="cpu", truncation=True, max_length=384)
 
     df = pd.read_csv(args.test_csv)
+    # カラム名の自動検出
+    title_col = args.title_col if args.title_col in df.columns else "TITLE"
+    body_col = args.body_col if args.body_col in df.columns else "BODY"
     texts = [
         build_input_text(
-            str(row[args.title_col]) if pd.notna(row[args.title_col]) else "",
-            str(row[args.body_col]) if pd.notna(row[args.body_col]) else "",
+            str(row[title_col]) if pd.notna(row[title_col]) else "",
+            str(row[body_col]) if pd.notna(row[body_col]) else "",
         )
         for _, row in df.iterrows()
     ]
@@ -46,7 +49,7 @@ def main():
     errors = [(i, labels[i], preds[i]) for i in range(len(labels)) if labels[i] != preds[i]]
     print(f"Errors: {len(errors)}")
     for i, expected, got in errors:
-        body = str(df.iloc[i][args.body_col])[:80].replace("\n", " ")
+        body = str(df.iloc[i][body_col])[:80].replace("\n", " ")
         print(f"  [{i}] expected={expected} got={got} | {body}")
 
 

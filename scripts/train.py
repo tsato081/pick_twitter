@@ -186,6 +186,7 @@ def main():
     tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
 
     model = build_model(model_name, tokenizer)
+    model.float()  # f16/f32混在をMPSが拒否するので統一
     model.to(device)
 
     # データセット

@@ -41,11 +41,12 @@ def build_input_text(title: str, body: str) -> str:
 
 
 def tokenize_fn(examples, tokenizer):
-    texts = [
-        build_input_text(t, b)
-        for t, b in zip(examples["TITLE"], examples["BODY"])
+    titles = [
+        t if t.strip() else EMPTY_TITLE_TOKEN
+        for t in examples["TITLE"]
     ]
-    return tokenizer(texts, truncation=True, max_length=384, padding="max_length")
+    bodies = list(examples["BODY"])
+    return tokenizer(titles, bodies, truncation=True, max_length=384, padding="max_length")
 
 
 def compute_metrics(eval_pred):

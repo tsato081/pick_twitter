@@ -126,8 +126,13 @@ def main():
     # テストデータで評価
     print("\n=== Test Evaluation ===")
     test_df = pd.read_csv("data/test/twitter_test.csv")
-    test_df["TITLE"] = test_df["title_original"].fillna("").astype(str)
-    test_df["BODY"] = test_df["body_original"].fillna("").astype(str)
+    # ローカル版(title_original)とHF版(TITLE)の両方に対応
+    if "title_original" in test_df.columns:
+        test_df["TITLE"] = test_df["title_original"].fillna("").astype(str)
+        test_df["BODY"] = test_df["body_original"].fillna("").astype(str)
+    else:
+        test_df["TITLE"] = test_df["TITLE"].fillna("").astype(str)
+        test_df["BODY"] = test_df["BODY"].fillna("").astype(str)
     test_df["label"] = test_df["pick"].map(LABEL2ID)
 
     test_ds = Dataset.from_pandas(test_df[["TITLE", "BODY", "label"]].reset_index(drop=True))

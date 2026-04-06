@@ -111,7 +111,26 @@ def main():
         report_to="none",
     )
 
-    trainer = Trainer(
+    FOCAL_GAMMA = 2.0
+    LABEL_SMOOTHING = 0.1
+
+    class FocalLossTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            labels = inputs.pop("labels")
+            outputs = model(**inputs)
+            logits = outputs.logits
+            # Label smoothing
+            n_classes = logits.size(-1)
+            smooth_labels = (1 - LABEL_SMOOTHING) * torch.nn.functional.one_hot(labels, n_classes).float() \
+                + LABEL_SMOOTHING / n_classes
+            # Focal loss
+            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            probs = log_probs.exp()
+            focal_weight = (1 - probs) ** FOCAL_GAMMA
+            loss = -(focal_weight * smooth_labels * log_probs).sum(dim=-1).mean()
+            return (loss, outputs) if return_outputs else loss
+
+    trainer = FocalLossTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,

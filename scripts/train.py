@@ -1,4 +1,4 @@
-"""modernbert-ja-70m を Pick/Decline 二値分類で fine-tuning する"""
+"""Pick/Decline 二値分類の fine-tuning"""
 
 import argparse
 
@@ -15,7 +15,10 @@ from transformers import (
     TrainingArguments,
 )
 
-MODEL_NAME = "sbintuitions/modernbert-ja-70m"
+MODELS = {
+    "modernbert": "sbintuitions/modernbert-ja-70m",
+    "deberta": "ku-nlp/deberta-v3-base-japanese",
+}
 EMPTY_TITLE_TOKEN = "[TITLE_EMPTY]"
 LABEL2ID = {"Decline": 0, "Pick": 1}
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
@@ -32,7 +35,6 @@ def load_data():
 
 
 def build_input_text(title: str, body: str) -> str:
-    """タイトルと本文を結合。空タイトルには特殊トークンを使う"""
     if not title or title.strip() == "":
         title = EMPTY_TITLE_TOKEN
     return f"{title} [SEP] {body}"
@@ -55,11 +57,20 @@ def compute_metrics(eval_pred):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", type=str, default="modernbert", choices=MODELS.keys())
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--output_dir", type=str, default="models/pick-classifier")
+    parser.add_argument("--focal_gamma", type=float, default=0.0, help="0 for CE loss, >0 for focal loss")
+    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
+
+    model_name = MODELS[args.model]
+    if args.output_dir is None:
+        args.output_dir = f"models/{args.model}-pick-classifier"
+
+    print(f"Model: {model_name}")
 
     # デバイス
     if torch.backends.mps.is_available():
@@ -81,11 +92,11 @@ def main():
     val_ds = Dataset.from_pandas(val_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
 
     # トークナイザー & モデル
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
 
     model = AutoModelForSequenceClassification.from_pretrained(
-        MODEL_NAME,
+        model_name,
         num_labels=2,
         id2label=ID2LABEL,
         label2id=LABEL2ID,
@@ -111,32 +122,49 @@ def main():
         report_to="none",
     )
 
-    FOCAL_GAMMA = 2.0
-    LABEL_SMOOTHING = 0.1
+    focal_gamma = args.focal_gamma
+    label_smoothing = args.label_smoothing
 
-    class FocalLossTrainer(Trainer):
-        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-            labels = inputs.pop("labels")
-            outputs = model(**inputs)
-            logits = outputs.logits
-            # Label smoothing
-            n_classes = logits.size(-1)
-            smooth_labels = (1 - LABEL_SMOOTHING) * torch.nn.functional.one_hot(labels, n_classes).float() \
-                + LABEL_SMOOTHING / n_classes
-            # Focal loss
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-            probs = log_probs.exp()
-            focal_weight = (1 - probs) ** FOCAL_GAMMA
-            loss = -(focal_weight * smooth_labels * log_probs).sum(dim=-1).mean()
-            return (loss, outputs) if return_outputs else loss
+    if focal_gamma > 0 or label_smoothing > 0:
+        print(f"Focal gamma: {focal_gamma}, Label smoothing: {label_smoothing}")
 
-    trainer = FocalLossTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        compute_metrics=compute_metrics,
-    )
+        class CustomTrainer(Trainer):
+            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+                labels = inputs.pop("labels")
+                outputs = model(**inputs)
+                logits = outputs.logits
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+                # Label smoothing
+                n_classes = logits.size(-1)
+                if label_smoothing > 0:
+                    targets = (1 - label_smoothing) * torch.nn.functional.one_hot(labels, n_classes).float() \
+                        + label_smoothing / n_classes
+                else:
+                    targets = torch.nn.functional.one_hot(labels, n_classes).float()
+                # Focal weight
+                if focal_gamma > 0:
+                    probs = log_probs.exp()
+                    focal_weight = (1 - probs) ** focal_gamma
+                    loss = -(focal_weight * targets * log_probs).sum(dim=-1).mean()
+                else:
+                    loss = -(targets * log_probs).sum(dim=-1).mean()
+                return (loss, outputs) if return_outputs else loss
+
+        trainer = CustomTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            compute_metrics=compute_metrics,
+        )
+    else:
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            compute_metrics=compute_metrics,
+        )
 
     trainer.train()
     trainer.save_model(args.output_dir)
@@ -146,7 +174,6 @@ def main():
     # テストデータで評価
     print("\n=== Test Evaluation ===")
     test_df = pd.read_csv("data/test/twitter_test.csv")
-    # ローカル版(title_original)とHF版(TITLE)の両方に対応
     if "title_original" in test_df.columns:
         test_df["TITLE"] = test_df["title_original"].fillna("").astype(str)
         test_df["BODY"] = test_df["body_original"].fillna("").astype(str)

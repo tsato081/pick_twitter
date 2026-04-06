@@ -93,7 +93,11 @@ def main():
 
     # トークナイザー & モデル
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
+
+    # DeBERTa v3はresize_token_embeddingsとの相性が悪いので、
+    # 特殊トークン追加はmodernbertのみ
+    if "modernbert" in model_name:
+        tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
 
     model = AutoModelForSequenceClassification.from_pretrained(
         model_name,
@@ -101,7 +105,9 @@ def main():
         id2label=ID2LABEL,
         label2id=LABEL2ID,
     )
-    model.resize_token_embeddings(len(tokenizer))
+
+    if "modernbert" in model_name:
+        model.resize_token_embeddings(len(tokenizer))
 
     train_ds = train_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)
     val_ds = val_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)

@@ -62,7 +62,7 @@ async def classify(sem: asyncio.Semaphore, title: str, body: str) -> tuple[str, 
 
 
 async def main():
-    df = pd.read_csv("data/raw/Twitter_2026-04-06-1217.csv")
+    df = pd.read_csv("data/raw/search_collected_v2.csv")
     df = df.reset_index(drop=True)
     print(f"Total: {len(df)} samples", flush=True)
 
@@ -89,8 +89,8 @@ async def main():
     print(f"Pick: {pick_count}, Decline: {decline_count}, Error: {error_count}", flush=True)
     print(f"Stage1 Decline: {sum(1 for s in stages if s == 's1')}, Passed to Stage2: {sum(1 for s in stages if s == 's2')}", flush=True)
 
-    df.to_csv("data/train/twitter_labeled.csv", index=False)
-    print("Saved to data/train/twitter_labeled.csv", flush=True)
+    df.to_csv("data/train/search_v2_labeled.csv", index=False)
+    print("Saved to data/train/search_v2_labeled.csv", flush=True)
 
 
 if __name__ == "__main__":

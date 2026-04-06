@@ -111,7 +111,24 @@ def main():
         report_to="none",
     )
 
-    trainer = Trainer(
+    RDROP_ALPHA = 0.5
+
+    class RDropTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            labels = inputs.get("labels")
+            outputs1 = model(**inputs)
+            outputs2 = model(**inputs)
+            loss_ce = (outputs1.loss + outputs2.loss) / 2
+            # KL divergence between two forward passes
+            p = torch.nn.functional.log_softmax(outputs1.logits, dim=-1)
+            q = torch.nn.functional.log_softmax(outputs2.logits, dim=-1)
+            kl_pq = torch.nn.functional.kl_div(p, q.exp(), reduction="batchmean", log_target=False)
+            kl_qp = torch.nn.functional.kl_div(q, p.exp(), reduction="batchmean", log_target=False)
+            loss_kl = (kl_pq + kl_qp) / 2
+            loss = loss_ce + RDROP_ALPHA * loss_kl
+            return (loss, outputs1) if return_outputs else loss
+
+    trainer = RDropTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,

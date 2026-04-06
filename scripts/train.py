@@ -2,6 +2,7 @@
 
 import argparse
 
+import numpy as np
 import pandas as pd
 import torch
 from datasets import Dataset
@@ -110,7 +111,24 @@ def main():
         report_to="none",
     )
 
-    trainer = Trainer(
+    # クラス重み: Pick(少数派)の損失を重くする
+    n_decline = (df["label"] == 0).sum()
+    n_pick = (df["label"] == 1).sum()
+    weight_decline = len(df) / (2 * n_decline)
+    weight_pick = len(df) / (2 * n_pick)
+    class_weights = torch.tensor([weight_decline, weight_pick], dtype=torch.float32)
+    print(f"Class weights: Decline={weight_decline:.2f}, Pick={weight_pick:.2f}")
+
+    class WeightedTrainer(Trainer):
+        def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+            labels = inputs.pop("labels")
+            outputs = model(**inputs)
+            logits = outputs.logits
+            loss_fn = torch.nn.CrossEntropyLoss(weight=class_weights.to(logits.device))
+            loss = loss_fn(logits, labels)
+            return (loss, outputs) if return_outputs else loss
+
+    trainer = WeightedTrainer(
         model=model,
         args=training_args,
         train_dataset=train_ds,

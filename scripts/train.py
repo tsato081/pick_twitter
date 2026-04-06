@@ -111,12 +111,18 @@ def main():
         label2id=LABEL2ID,
     )
 
-    # DeBERTa v3 の embedding weight ロード確認
+    # DeBERTa v3: transformers v5.xで _weight -> weight のリマップが欠落している問題を修正
     if "deberta" in model_name:
-        emb = model.deberta.embeddings.word_embeddings.weight
-        print(f"Embedding stats: mean={emb.mean().item():.4f}, std={emb.std().item():.4f}, min={emb.min().item():.4f}, max={emb.max().item():.4f}")
-        if emb.std().item() < 0.001 or emb.std().item() > 10:
-            print("WARNING: Embeddings may not be loaded correctly!")
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        ckpt_path = hf_hub_download(model_name, "model.safetensors")
+        state_dict = load_file(ckpt_path)
+        key_old = "deberta.embeddings.word_embeddings._weight"
+        key_new = "deberta.embeddings.word_embeddings.weight"
+        if key_old in state_dict:
+            state_dict[key_new] = state_dict.pop(key_old)
+            model.load_state_dict(state_dict, strict=False)
+            print(f"Fixed DeBERTa embedding key: {key_old} -> {key_new}")
 
     if "modernbert" in model_name:
         model.resize_token_embeddings(len(tokenizer))
@@ -137,7 +143,6 @@ def main():
         metric_for_best_model="accuracy",
         logging_steps=50,
         fp16=device == "cuda",
-        no_cuda=args.cpu,
         use_cpu=args.cpu,
         report_to="none",
     )

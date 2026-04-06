@@ -11,6 +11,7 @@ from sklearn.model_selection import train_test_split
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
+    DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
 )
@@ -46,7 +47,7 @@ def tokenize_fn(examples, tokenizer):
         for t in examples["TITLE"]
     ]
     bodies = list(examples["BODY"])
-    return tokenizer(titles, bodies, truncation=True, max_length=384, padding="max_length")
+    return tokenizer(titles, bodies, truncation=True, max_length=384)
 
 
 def compute_metrics(eval_pred):
@@ -65,6 +66,7 @@ def main():
     parser.add_argument("--focal_gamma", type=float, default=0.0, help="0 for CE loss, >0 for focal loss")
     parser.add_argument("--label_smoothing", type=float, default=0.0)
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--cpu", action="store_true", help="Force CPU")
     args = parser.parse_args()
 
     model_name = MODELS[args.model]
@@ -74,7 +76,9 @@ def main():
     print(f"Model: {model_name}")
 
     # デバイス
-    if torch.backends.mps.is_available():
+    if args.cpu:
+        device = "cpu"
+    elif torch.backends.mps.is_available():
         device = "mps"
     elif torch.cuda.is_available():
         device = "cuda"
@@ -133,6 +137,8 @@ def main():
         metric_for_best_model="accuracy",
         logging_steps=50,
         fp16=device == "cuda",
+        no_cuda=args.cpu,
+        use_cpu=args.cpu,
         report_to="none",
     )
 
@@ -169,6 +175,7 @@ def main():
             args=training_args,
             train_dataset=train_ds,
             eval_dataset=val_ds,
+            data_collator=DataCollatorWithPadding(tokenizer),
             compute_metrics=compute_metrics,
         )
     else:
@@ -177,6 +184,7 @@ def main():
             args=training_args,
             train_dataset=train_ds,
             eval_dataset=val_ds,
+            data_collator=DataCollatorWithPadding(tokenizer),
             compute_metrics=compute_metrics,
         )
 

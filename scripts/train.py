@@ -112,17 +112,19 @@ def main():
     )
 
     # DeBERTa v3: transformers v5.xで _weight -> weight のリマップが欠落している問題を修正
+    # embeddingのみ修正（全state_dictの再ロードは副作用があるため避ける）
     if "deberta" in model_name:
         from huggingface_hub import hf_hub_download
         from safetensors.torch import load_file
         ckpt_path = hf_hub_download(model_name, "model.safetensors")
         state_dict = load_file(ckpt_path)
         key_old = "deberta.embeddings.word_embeddings._weight"
-        key_new = "deberta.embeddings.word_embeddings.weight"
         if key_old in state_dict:
-            state_dict[key_new] = state_dict.pop(key_old)
-            model.load_state_dict(state_dict, strict=False)
-            print(f"Fixed DeBERTa embedding key: {key_old} -> {key_new}")
+            with torch.no_grad():
+                model.deberta.embeddings.word_embeddings.weight.copy_(state_dict[key_old])
+            print(f"Fixed DeBERTa embedding: loaded from {key_old}")
+        tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
+        model.resize_token_embeddings(len(tokenizer))
 
     if "modernbert" in model_name:
         model.resize_token_embeddings(len(tokenizer))

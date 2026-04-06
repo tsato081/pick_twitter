@@ -1,20 +1,18 @@
-"""Pick/Decline 二値分類の fine-tuning"""
+"""Pick/Decline 二値分類の fine-tuning (manual training loop)"""
 
 import argparse
+import json
+from pathlib import Path
 
-import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
 from datasets import Dataset
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import train_test_split
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    DataCollatorWithPadding,
-    Trainer,
-    TrainingArguments,
-)
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+from transformers import AutoConfig, AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 MODELS = {
     "modernbert": "sbintuitions/modernbert-ja-70m",
@@ -25,8 +23,25 @@ LABEL2ID = {"Decline": 0, "Pick": 1}
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
 
 
+class PickClassifier(nn.Module):
+    def __init__(self, encoder, num_labels=2):
+        super().__init__()
+        self.encoder = encoder
+        hidden = encoder.config.hidden_size
+        self.pooler = nn.Linear(hidden, hidden)
+        self.classifier = nn.Linear(hidden, num_labels)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        cls_output = outputs.last_hidden_state[:, 0]
+        pooled = torch.tanh(self.pooler(cls_output))
+        pooled = self.dropout(pooled)
+        logits = self.classifier(pooled)
+        return logits
+
+
 def load_data():
-    """訓練データを読み込む"""
     df = pd.read_csv("data/train/train.csv")
     df = df[df["pick"].isin(["Pick", "Decline"])].reset_index(drop=True)
     df["TITLE"] = df["TITLE"].fillna("").astype(str)
@@ -35,26 +50,98 @@ def load_data():
     return df
 
 
-def build_input_text(title: str, body: str) -> str:
-    if not title or title.strip() == "":
-        title = EMPTY_TITLE_TOKEN
-    return f"{title} [SEP] {body}"
-
-
-def tokenize_fn(examples, tokenizer):
-    titles = [
-        t if t.strip() else EMPTY_TITLE_TOKEN
-        for t in examples["TITLE"]
-    ]
+def tokenize_fn(examples, tokenizer, max_length):
+    titles = [t if t.strip() else EMPTY_TITLE_TOKEN for t in examples["TITLE"]]
     bodies = list(examples["BODY"])
-    return tokenizer(titles, bodies, truncation=True, max_length=384)
+    return tokenizer(titles, bodies, truncation=True, max_length=max_length)
 
 
-def compute_metrics(eval_pred):
-    logits, labels = eval_pred
-    preds = logits.argmax(axis=-1)
-    acc = accuracy_score(labels, preds)
-    return {"accuracy": acc}
+def dynamic_pad_collate(batch):
+    """バッチ内の最長に合わせてパディング"""
+    max_len = max(len(b["input_ids"]) for b in batch)
+    input_ids, attention_mask, labels = [], [], []
+    # token_type_ids がある場合も対応
+    has_token_type = "token_type_ids" in batch[0]
+    token_type_ids = [] if has_token_type else None
+
+    for b in batch:
+        pad_len = max_len - len(b["input_ids"])
+        input_ids.append(b["input_ids"] + [0] * pad_len)
+        attention_mask.append(b["attention_mask"] + [0] * pad_len)
+        if has_token_type:
+            token_type_ids.append(b["token_type_ids"] + [0] * pad_len)
+        labels.append(b["label"])
+
+    result = {
+        "input_ids": torch.tensor(input_ids, dtype=torch.long),
+        "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+        "labels": torch.tensor(labels, dtype=torch.long),
+    }
+    if has_token_type:
+        result["token_type_ids"] = torch.tensor(token_type_ids, dtype=torch.long)
+    return result
+
+
+def build_model(model_name, tokenizer):
+    """エンコーダ + 分類ヘッドを構築"""
+    encoder = AutoModel.from_pretrained(model_name)
+
+    # DeBERTa v3: transformers v5.xで _weight キーがロードされない問題を修正
+    if "deberta" in model_name:
+        from huggingface_hub import hf_hub_download
+        from safetensors.torch import load_file
+        ckpt_path = hf_hub_download(model_name, "model.safetensors")
+        state_dict = load_file(ckpt_path)
+        key_old = "deberta.embeddings.word_embeddings._weight"
+        if key_old in state_dict:
+            with torch.no_grad():
+                encoder.embeddings.word_embeddings.weight.copy_(state_dict[key_old])
+            print(f"Fixed DeBERTa embedding: loaded from {key_old}")
+
+    encoder.resize_token_embeddings(len(tokenizer))
+    model = PickClassifier(encoder, num_labels=2)
+    return model
+
+
+def train_one_epoch(model, loader, optimizer, scheduler, device):
+    model.train()
+    total_loss = 0.0
+    loss_fn = nn.CrossEntropyLoss()
+
+    for batch in tqdm(loader, desc="train", leave=False):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"].to(device)
+
+        logits = model(input_ids, attention_mask)
+        loss = loss_fn(logits, labels)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+
+        total_loss += loss.item()
+
+    return total_loss / max(len(loader), 1)
+
+
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    all_preds, all_labels = [], []
+
+    for batch in tqdm(loader, desc="eval", leave=False):
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        labels = batch["labels"]
+
+        logits = model(input_ids, attention_mask)
+        preds = logits.argmax(dim=-1).cpu()
+        all_preds.extend(preds.tolist())
+        all_labels.extend(labels.tolist())
+
+    return all_labels, all_preds
 
 
 def main():
@@ -63,27 +150,28 @@ def main():
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=2e-5)
-    parser.add_argument("--focal_gamma", type=float, default=0.0, help="0 for CE loss, >0 for focal loss")
-    parser.add_argument("--label_smoothing", type=float, default=0.0)
+    parser.add_argument("--max_length", type=int, default=384)
+    parser.add_argument("--warmup_ratio", type=float, default=0.1)
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--cpu", action="store_true", help="Force CPU")
+    parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
     model_name = MODELS[args.model]
     if args.output_dir is None:
         args.output_dir = f"models/{args.model}-pick-classifier"
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Model: {model_name}")
 
-    # デバイス
     if args.cpu:
-        device = "cpu"
+        device = torch.device("cpu")
     elif torch.backends.mps.is_available():
-        device = "mps"
+        device = torch.device("mps")
     elif torch.cuda.is_available():
-        device = "cuda"
+        device = torch.device("cuda")
     else:
-        device = "cpu"
+        device = torch.device("cpu")
     print(f"Device: {device}")
 
     # データ
@@ -93,112 +181,67 @@ def main():
     train_df, val_df = train_test_split(df, test_size=0.1, stratify=df["label"], random_state=42)
     print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
-    train_ds = Dataset.from_pandas(train_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
-    val_ds = Dataset.from_pandas(val_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
-
     # トークナイザー & モデル
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
 
-    # DeBERTa v3はresize_token_embeddingsとの相性が悪いので、
-    # 特殊トークン追加はmodernbertのみ
-    if "modernbert" in model_name:
-        tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
+    model = build_model(model_name, tokenizer)
+    model.to(device)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_name,
-        num_labels=2,
-        id2label=ID2LABEL,
-        label2id=LABEL2ID,
-    )
+    # データセット
+    train_ds = Dataset.from_pandas(train_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
+    val_ds = Dataset.from_pandas(val_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
+    train_ds = train_ds.map(lambda x: tokenize_fn(x, tokenizer, args.max_length), batched=True)
+    val_ds = val_ds.map(lambda x: tokenize_fn(x, tokenizer, args.max_length), batched=True)
 
-    # DeBERTa v3: transformers v5.xで _weight -> weight のリマップが欠落している問題を修正
-    # embeddingのみ修正（全state_dictの再ロードは副作用があるため避ける）
-    if "deberta" in model_name:
-        from huggingface_hub import hf_hub_download
-        from safetensors.torch import load_file
-        ckpt_path = hf_hub_download(model_name, "model.safetensors")
-        state_dict = load_file(ckpt_path)
-        key_old = "deberta.embeddings.word_embeddings._weight"
-        if key_old in state_dict:
-            with torch.no_grad():
-                model.deberta.embeddings.word_embeddings.weight.copy_(state_dict[key_old])
-            print(f"Fixed DeBERTa embedding: loaded from {key_old}")
-        tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
-        model.resize_token_embeddings(len(tokenizer))
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=dynamic_pad_collate)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, collate_fn=dynamic_pad_collate)
 
-    if "modernbert" in model_name:
-        model.resize_token_embeddings(len(tokenizer))
+    # Optimizer & Scheduler
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.01)
+    total_steps = len(train_loader) * args.epochs
+    warmup_steps = int(total_steps * args.warmup_ratio)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
 
-    train_ds = train_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)
-    val_ds = val_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)
+    # 学習
+    best_acc = 0.0
+    best_state = None
 
-    training_args = TrainingArguments(
-        output_dir=args.output_dir,
-        num_train_epochs=args.epochs,
-        per_device_train_batch_size=args.batch_size,
-        per_device_eval_batch_size=args.batch_size,
-        learning_rate=args.lr,
-        weight_decay=0.01,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="accuracy",
-        logging_steps=50,
-        fp16=device == "cuda",
-        use_cpu=args.cpu,
-        report_to="none",
-    )
+    for epoch in range(args.epochs):
+        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, device)
 
-    focal_gamma = args.focal_gamma
-    label_smoothing = args.label_smoothing
+        val_labels, val_preds = evaluate(model, val_loader, device)
+        val_acc = accuracy_score(val_labels, val_preds)
 
-    if focal_gamma > 0 or label_smoothing > 0:
-        print(f"Focal gamma: {focal_gamma}, Label smoothing: {label_smoothing}")
+        print(f"Epoch {epoch+1}/{args.epochs} - loss: {train_loss:.4f}, val_acc: {val_acc:.4f}")
 
-        class CustomTrainer(Trainer):
-            def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-                labels = inputs.pop("labels")
-                outputs = model(**inputs)
-                logits = outputs.logits
-                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
-                # Label smoothing
-                n_classes = logits.size(-1)
-                if label_smoothing > 0:
-                    targets = (1 - label_smoothing) * torch.nn.functional.one_hot(labels, n_classes).float() \
-                        + label_smoothing / n_classes
-                else:
-                    targets = torch.nn.functional.one_hot(labels, n_classes).float()
-                # Focal weight
-                if focal_gamma > 0:
-                    probs = log_probs.exp()
-                    focal_weight = (1 - probs) ** focal_gamma
-                    loss = -(focal_weight * targets * log_probs).sum(dim=-1).mean()
-                else:
-                    loss = -(targets * log_probs).sum(dim=-1).mean()
-                return (loss, outputs) if return_outputs else loss
+        if val_acc > best_acc:
+            best_acc = val_acc
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        trainer = CustomTrainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            data_collator=DataCollatorWithPadding(tokenizer),
-            compute_metrics=compute_metrics,
-        )
-    else:
-        trainer = Trainer(
-            model=model,
-            args=training_args,
-            train_dataset=train_ds,
-            eval_dataset=val_ds,
-            data_collator=DataCollatorWithPadding(tokenizer),
-            compute_metrics=compute_metrics,
-        )
+        if device.type == "mps":
+            torch.mps.empty_cache()
 
-    trainer.train()
-    trainer.save_model(args.output_dir)
-    tokenizer.save_pretrained(args.output_dir)
-    print(f"Model saved to {args.output_dir}")
+    # ベストモデルを保存
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    model.to(device)
+
+    from safetensors.torch import save_file as save_safetensors
+    save_safetensors(best_state, str(output_dir / "model.safetensors"))
+    tokenizer.save_pretrained(str(output_dir))
+    # config保存
+    config = {
+        "model_name": model_name,
+        "num_labels": 2,
+        "label2id": LABEL2ID,
+        "id2label": ID2LABEL,
+        "max_length": args.max_length,
+        "title_empty_token": EMPTY_TITLE_TOKEN,
+    }
+    with open(output_dir / "config.json", "w") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    print(f"Model saved to {output_dir}")
 
     # テストデータで評価
     print("\n=== Test Evaluation ===")
@@ -212,14 +255,12 @@ def main():
     test_df["label"] = test_df["pick"].map(LABEL2ID)
 
     test_ds = Dataset.from_pandas(test_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
-    test_ds = test_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)
+    test_ds = test_ds.map(lambda x: tokenize_fn(x, tokenizer, args.max_length), batched=True)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, collate_fn=dynamic_pad_collate)
 
-    preds_output = trainer.predict(test_ds)
-    preds = preds_output.predictions.argmax(axis=-1)
-    labels = preds_output.label_ids
-
-    print(f"Accuracy: {accuracy_score(labels, preds):.1%}")
-    print(classification_report(labels, preds, target_names=["Decline", "Pick"]))
+    test_labels, test_preds = evaluate(model, test_loader, device)
+    print(f"Accuracy: {accuracy_score(test_labels, test_preds):.1%}")
+    print(classification_report(test_labels, test_preds, target_names=["Decline", "Pick"]))
 
 
 if __name__ == "__main__":

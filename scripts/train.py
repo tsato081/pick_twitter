@@ -1,0 +1,145 @@
+"""modernbert-ja-70m を Pick/Decline 二値分類で fine-tuning する"""
+
+import argparse
+
+import pandas as pd
+import torch
+from datasets import Dataset
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+)
+
+MODEL_NAME = "sbintuitions/modernbert-ja-70m"
+EMPTY_TITLE_TOKEN = "[TITLE_EMPTY]"
+LABEL2ID = {"Decline": 0, "Pick": 1}
+ID2LABEL = {v: k for k, v in LABEL2ID.items()}
+
+
+def load_data():
+    """訓練データを読み込む"""
+    df = pd.read_csv("data/train/train.csv")
+    df = df[df["pick"].isin(["Pick", "Decline"])].reset_index(drop=True)
+    df["TITLE"] = df["TITLE"].fillna("").astype(str)
+    df["BODY"] = df["BODY"].fillna("").astype(str)
+    df["label"] = df["pick"].map(LABEL2ID)
+    return df
+
+
+def build_input_text(title: str, body: str) -> str:
+    """タイトルと本文を結合。空タイトルには特殊トークンを使う"""
+    if not title or title.strip() == "":
+        title = EMPTY_TITLE_TOKEN
+    return f"{title} [SEP] {body}"
+
+
+def tokenize_fn(examples, tokenizer):
+    texts = [
+        build_input_text(t, b)
+        for t, b in zip(examples["TITLE"], examples["BODY"])
+    ]
+    return tokenizer(texts, truncation=True, max_length=384, padding="max_length")
+
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = logits.argmax(axis=-1)
+    acc = accuracy_score(labels, preds)
+    return {"accuracy": acc}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=5)
+    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--output_dir", type=str, default="models/pick-classifier")
+    args = parser.parse_args()
+
+    # デバイス
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+    print(f"Device: {device}")
+
+    # データ
+    df = load_data()
+    print(f"Total: {len(df)} (Pick: {(df['label']==1).sum()}, Decline: {(df['label']==0).sum()})")
+
+    train_df, val_df = train_test_split(df, test_size=0.1, stratify=df["label"], random_state=42)
+    print(f"Train: {len(train_df)}, Val: {len(val_df)}")
+
+    train_ds = Dataset.from_pandas(train_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
+    val_ds = Dataset.from_pandas(val_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
+
+    # トークナイザー & モデル
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    tokenizer.add_special_tokens({"additional_special_tokens": [EMPTY_TITLE_TOKEN]})
+
+    model = AutoModelForSequenceClassification.from_pretrained(
+        MODEL_NAME,
+        num_labels=2,
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+    )
+    model.resize_token_embeddings(len(tokenizer))
+
+    train_ds = train_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)
+    val_ds = val_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)
+
+    training_args = TrainingArguments(
+        output_dir=args.output_dir,
+        num_train_epochs=args.epochs,
+        per_device_train_batch_size=args.batch_size,
+        per_device_eval_batch_size=args.batch_size,
+        learning_rate=args.lr,
+        weight_decay=0.01,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="accuracy",
+        logging_steps=50,
+        fp16=device == "cuda",
+        report_to="none",
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_ds,
+        eval_dataset=val_ds,
+        compute_metrics=compute_metrics,
+    )
+
+    trainer.train()
+    trainer.save_model(args.output_dir)
+    tokenizer.save_pretrained(args.output_dir)
+    print(f"Model saved to {args.output_dir}")
+
+    # テストデータで評価
+    print("\n=== Test Evaluation ===")
+    test_df = pd.read_csv("data/test/twitter_test.csv")
+    test_df["TITLE"] = test_df["title_original"].fillna("").astype(str)
+    test_df["BODY"] = test_df["body_original"].fillna("").astype(str)
+    test_df["label"] = test_df["pick"].map(LABEL2ID)
+
+    test_ds = Dataset.from_pandas(test_df[["TITLE", "BODY", "label"]].reset_index(drop=True))
+    test_ds = test_ds.map(lambda x: tokenize_fn(x, tokenizer), batched=True)
+
+    preds_output = trainer.predict(test_ds)
+    preds = preds_output.predictions.argmax(axis=-1)
+    labels = preds_output.label_ids
+
+    print(f"Accuracy: {accuracy_score(labels, preds):.1%}")
+    print(classification_report(labels, preds, target_names=["Decline", "Pick"]))
+
+
+if __name__ == "__main__":
+    main()

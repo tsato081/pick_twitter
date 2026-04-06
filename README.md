@@ -28,10 +28,6 @@ print('Done')
 "
 ```
 
-データを `data/train/` に配置:
-- `empty_title_critical_labeled.csv` (6,495件, Pick多め)
-- `twitter_labeled.csv` (10,000件, Decline多め)
-
 ### 3. 学習
 
 ```bash
@@ -53,10 +49,18 @@ MPS/CUDA/CPUは自動検出。学習後にテストデータ (`data/test/twitter
 
 ### 4. テストデータでの評価
 
-学習完了時に自動で実行されます。出力例:
+学習完了時に自動で実行されます。別途単体で実行する場合:
+
+```bash
+uv run python scripts/evaluate.py
 ```
-Accuracy: XX.X%
-              precision    recall  f1-score   support
-     Decline       ...
-        Pick       ...
+
+`models/` 以下の最新モデルを自動検出し、`twitter_test.csv` と `canary.csv` の両方で評価します。
+
+### 5. モデルをHuggingFaceにpush
+
+精度を確認した上で実行:
+
+```bash
+uv run python scripts/push_model.py --repo_id teru00801/pick-twitter-classifier
 ```
